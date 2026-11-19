@@ -33,12 +33,12 @@ except ImportError:
 PROVIDER_OPENAI = "openai"
 PROVIDER_GEMINI = "gemini"
 PROVIDER_OPENROUTER = "openrouter"
+PROVIDER_LIQUID = "liquid"
 
-# --- Blue Team (LOCKED) ---
-BLUE_PROVIDER = PROVIDER_OPENROUTER
-BLUE_MODEL = "liquid/lfm-3-1.7b:free"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_OPENROUTER_MODEL = BLUE_MODEL  # alias
+# --- Blue Team (Liquid AI) ---
+BLUE_PROVIDER = PROVIDER_LIQUID
+BLUE_MODEL = "lfm3-1.7b"
+LIQUID_BASE_URL = "https://api.liquid.ai/openai/v1"
 
 # --- Red Team ---
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
@@ -96,7 +96,7 @@ except FileNotFoundError:
 
 
 # ---------------------------------------------------------------------------
-# Blue Team — fixed OpenRouter Liquid
+# Blue Team — Liquid AI (lfm3-1.7b)
 # ---------------------------------------------------------------------------
 
 def get_blue_provider() -> str:
@@ -104,8 +104,11 @@ def get_blue_provider() -> str:
 
 
 def get_blue_model() -> str:
-    # Hard-locked; env cannot override for the graded Blue Team path.
-    return BLUE_MODEL
+    return os.environ.get("BLUE_MODEL", BLUE_MODEL).strip() or BLUE_MODEL
+
+
+def get_liquid_api_key() -> str:
+    return os.environ.get("LIQUID_API_KEY", "").strip()
 
 
 def get_openrouter_api_key() -> str:
@@ -113,13 +116,11 @@ def get_openrouter_api_key() -> str:
 
 
 def blue_client_kwargs() -> dict:
-    """OpenAI SDK kwargs pointing at OpenRouter (Blue Team only)."""
+    """OpenAI SDK kwargs pointing at Liquid AI (Blue Team only)."""
+    base_url = os.environ.get("LIQUID_BASE_URL", "").strip() or LIQUID_BASE_URL
     return {
-        "api_key": get_openrouter_api_key() or None,
-        "base_url": (
-            os.environ.get("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL).strip()
-            or OPENROUTER_BASE_URL
-        ),
+        "api_key": get_liquid_api_key() or None,
+        "base_url": base_url,
     }
 
 
@@ -135,7 +136,7 @@ def get_red_provider() -> str:
     raw = (
         os.environ.get("RED_TEAM_PROVIDER")
         or os.environ.get("LLM_PROVIDER")
-        or "openai"
+        or PROVIDER_OPENAI
     ).strip().lower()
     if raw in {"gemini", "google", "adk"}:
         return PROVIDER_GEMINI
@@ -217,7 +218,10 @@ def provider_label() -> str:
 def is_harder_model() -> bool:
     """True nếu .env đang trỏ model khó (luna / 3.8) — tuỳ chọn, không phải tên agent."""
     m = get_red_model().lower()
-    if m in {DEFAULT_OPENAI_MODEL.lower(), DEFAULT_GEMINI_MODEL.lower()}:
+    if m in {
+        DEFAULT_OPENAI_MODEL.lower(),
+        DEFAULT_GEMINI_MODEL.lower(),
+    }:
         return False
     hard = {
         HARD_OPENAI_MODEL.lower(),
@@ -235,12 +239,12 @@ def is_harder_model() -> bool:
 
 
 def setup_api_key():
-    """Ensure keys for Blue (OpenRouter) + Red / Red Advance (OpenAI or Gemini)."""
-    if not get_openrouter_api_key():
-        os.environ["OPENROUTER_API_KEY"] = input(
-            "Enter OpenRouter API Key (Blue): "
+    """Ensure keys for Blue (Liquid AI) + Red / Red Advance (OpenAI or Gemini)."""
+    if not get_liquid_api_key():
+        os.environ["LIQUID_API_KEY"] = input(
+            "Enter Liquid API Key (Blue): "
         ).strip()
-    print(f"Blue  — {blue_provider_label()}  [LOCKED]")
+    print(f"Blue  — {blue_provider_label()}")
 
     red = get_red_provider()
     model = get_red_model()

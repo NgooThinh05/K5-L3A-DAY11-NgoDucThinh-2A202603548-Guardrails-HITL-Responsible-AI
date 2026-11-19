@@ -4,6 +4,9 @@ Checkpoint 2 — Output Guardrails
   - OutputGuardrailPlugin (ADK)           ← bắt buộc
   - LLM-as-Judge                          ← optional (không chấm)
 """
+import base64
+import binascii
+import codecs
 import re
 import textwrap
 
@@ -13,6 +16,26 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+
+_B64_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{8,}={0,2}(?![A-Za-z0-9+/_=-])")
+_HEX_TOKEN_RE = re.compile(
+    r"(?<![0-9a-fA-F])[0-9a-fA-F]{2}(?:[\s:-]?[0-9a-fA-F]{2}){5,}(?![0-9a-fA-F])"
+)
+
+
+def _squash_alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _contains_any_secret(text: str, needles: list[str]) -> bool:
+    if not text:
+        return False
+    views = (text, text[::-1], codecs.decode(text, "rot_13"))
+    for view in views:
+        sq = _squash_alnum(view)
+        if any(n in sq for n in needles):
+            return True
+    return False
 
 
 # ============================================================
@@ -39,14 +62,14 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
-    # PII patterns to check
+    # PII and secret patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "api_key": r"\bsk-[a-zA-Z0-9_-]{6,}\b",
+        "password": r"\b(?:password|passcode|mat khau|mật khẩu)\s*(?:[:=]|is|là)\s*\S+",
+        "db_host": r"\b[\w.-]+\.internal(?::\d+)?\b",
+        "email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "phone": r"\b0\d{9,10}\b",
+        "national_id": r"\b(?:\d{9}|\d{12})\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -54,6 +77,50 @@ def content_filter(response: str) -> dict:
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Also catch exact, reversed, ROT13, Base64, or Hex encoded DEMO_SECRETS
+    from core.config import DEMO_SECRETS
+
+    secret_needles = [_squash_alnum(s) for s in DEMO_SECRETS if _squash_alnum(s)]
+
+    for secret in DEMO_SECRETS:
+        if not secret:
+            continue
+        variants = (
+            ("internal_secret", secret),
+            ("obfuscated_secret", secret[::-1]),
+            ("obfuscated_secret", codecs.decode(secret, "rot_13")),
+        )
+        for label, variant in variants:
+            if variant and re.search(re.escape(variant), redacted, re.IGNORECASE):
+                issues.append(f"{label}: found")
+                redacted = re.sub(
+                    re.escape(variant), "[REDACTED]", redacted, flags=re.IGNORECASE
+                )
+
+    # Catch Base64-encoded secrets
+    for token in set(_B64_TOKEN_RE.findall(redacted)):
+        padded = token.replace("-", "+").replace("_", "/")
+        padded += "=" * (-len(padded) % 4)
+        try:
+            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+        except (binascii.Error, ValueError):
+            continue
+        if _contains_any_secret(decoded, secret_needles):
+            issues.append("encoded_secret: base64 found")
+            redacted = redacted.replace(token, "[REDACTED]")
+
+    # Catch Hex-encoded secrets
+    for token in set(_HEX_TOKEN_RE.findall(redacted)):
+        digits = re.sub(r"[^0-9a-fA-F]", "", token)
+        digits = digits[: len(digits) - (len(digits) % 2)]
+        try:
+            decoded = bytes.fromhex(digits).decode("utf-8", errors="ignore")
+        except ValueError:
+            continue
+        if _contains_any_secret(decoded, secret_needles):
+            issues.append("encoded_secret: hex found")
+            redacted = redacted.replace(token, "[REDACTED]")
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +239,32 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            response_text = result["redacted"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=response_text)],
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge = await llm_safety_check(response_text)
+            if not judge["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "I cannot share that response due to safety policies. "
+                                "Please ask a general VinBank banking question."
+                            )
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================
